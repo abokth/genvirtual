@@ -1,0 +1,518 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# MIT/X11 License
+#
+# Copyright (c) 2019, Kungliga Tekniska högskolan
+# (Royal Institute of Technology, Stockholm Sweden)
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Generates a postfix style virtual file based on the contents of an SQL database.
+
+import sys
+import configparser
+import importlib
+import re
+
+### Models ###
+
+class DomainRegistry():
+    """A set of domain names."""
+
+    def __init__(self, *domains):
+        self.domain_names = set()
+        self.domain_names.update(domains)
+
+    def add_from_email(self, email):
+        (u, domain) = email.split("@")
+        if domain not in self.domain_names:
+            self.domain_names.add(domain)
+
+class EmailAddress:
+    """An email address along with some attributes."""
+
+    def __init__(self, address, in_default_domain, external):
+        self.address = address
+        (self.username, self.domainname) = address.split("@", 1)
+        self.in_default_domain = in_default_domain
+        self.external = external
+
+    def __str__(self):
+        return self.address
+
+    def __eq__(self, other):
+        return self.address == other.address
+
+    def __hash__(self):
+        return hash(self.address)
+
+    def __lt__(self, other):
+        # First all addresses on the default domain, then other internal domains, then other domain.
+        # Sort those by domain, then by username.
+        def key(o):
+            return (not o.in_default_domain, o.external, list(reversed(o.domainname.split("."))), o.username)
+        return key(self) < key(other)
+
+class EmailAddressRegistry:
+    """Manages EmailAddress objects."""
+
+    def __init__(self, default_domain):
+        self.default_domain = default_domain
+        self.by_emailaddress = dict()
+        self._validate = re.compile("(^[*a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)")
+
+    def get(self, s, create=False):
+        if "@" not in s:
+            s = "{}@{}".format(s, self.default_domain)
+        # if self._validate.match(s) is None:
+        #     raise ValueError("invalid email address: {}".format(s))
+        emailaddress = self.by_emailaddress.get(s, None)
+        if emailaddress is not None:
+            return emailaddress
+        if not create:
+            raise Exception("Tried to reference emailaddress {} which was not defined.".format(s))
+
+        domainname = s.split("@", 1)[1]
+        indefault = domainname == self.default_domain
+        external = not (indefault or domainname.endswith(".{}".format(self.default_domain)))
+        emailaddress = EmailAddress(s, indefault, external)
+        self.by_emailaddress[emailaddress.address] = emailaddress
+        return emailaddress
+
+class Delivery:
+    """Describes a set of destinations for email delivery along with some conditions."""
+
+    def __init__(self):
+        self.recipients = None
+        self.comment = None
+        self.warnings = None
+        self.defined = False
+
+# Users
+class User():
+    """Describes email delivery for a user."""
+
+    def __init__(self, userid):
+        self.userid = userid
+        self._hash = hash(userid)
+        self.addresses = []
+        self.username = None
+        self._email_forward = set()
+        self.email_enabled = True
+
+    def __str__(self):
+        if self.username is not None:
+            return "User {} ({})".format(self.userid, self.username)
+        return "User {} (no username)".format(self.userid)
+
+    def __eq__(self, other):
+        return self.userid == other.userid
+
+    def __hash__(self):
+        return self._hash
+
+    def __lt__(self, other):
+        return self.userid < other.userid
+
+    # alternate sort order
+    @property
+    def friendly_sort_key(self):
+        return ("" if self.username is None else self.username, self.userid)
+
+    @property
+    def delivery(self):
+        d = Delivery()
+        if len(self._email_forward) > 0:
+            d.recipients = sorted(self._email_forward)
+            d.comment = str(self)
+            d.defined = True
+        else:
+            d.comment = "{} has no delivery address.".format(str(self))
+        return d
+
+    @property
+    def valid(self):
+        return self.username is not None
+
+    @property
+    def email_forward(self):
+        if not self.has_email_delivery:
+            raise Exception("tried to get email_forward of user {}".format(self.userid))
+        return self._email_forward
+
+    def add_email_forward(self, s):
+        self._email_forward.add(s)
+
+    @property
+    def has_email_delivery(self):
+        return len(self._email_forward) > 0
+
+    @property
+    def external_forward(self):
+        for e in self.email_forward:
+            if e.external:
+                return True
+        return False
+
+class UserRegistry():
+    """Manages User objects."""
+
+    def __init__(self):
+        self.by_userids = dict()
+
+    def get(self, userid, create=False):
+        user = self.by_userids.get(userid, None)
+        if user is not None:
+            return user
+        if not create:
+            # This probably means the database has a group which defines a user as a member, but the member is not in the database.
+            # Most likely the database is being updated, in which case its best to stop here and try again in a little while.
+            raise Exception("Tried to reference user with userid {} which was not defined.".format(userid))
+        user = User(userid)
+        self.by_userids[userid] = user
+        return user
+
+    def sorted_by(self, **kwargs):
+        return sorted(self.by_userids.values(), **kwargs)
+
+# Groups
+class Group():
+    """Describes email delivery for a group, based on email addresses associated with the group, nesting of group memberships, users in the group and explicitly added destination addresses."""
+
+    def __init__(self, groupid):
+        self.groupid = groupid
+        self.name = None
+        self._member_users = set()
+        self._member_groups = set()
+        self.addresses = []
+        self.groupname = None
+        self._email_recipients = None
+
+    def __str__(self):
+        return "Group {}".self.groupid if self.name is None else "Group {} ({})".format(self.name, self.groupid)
+
+    def __eq__(self, other):
+        return self.groupid == other.groupid
+
+    def __hash__(self):
+        return hash(self.groupid)
+
+    def __lt__(self, other):
+        return self.groupid < other.groupid
+
+    # alternate sort order
+    @property
+    def friendly_sort_key(self):
+        return ("" if self.name is None else self.name, self.groupid)
+
+    @property
+    def delivery(self):
+        d = Delivery()
+
+        sorted_email_recipients = sorted(self.recursive_email_recipients)
+
+        def shortened_user_list(s, **kwargs):
+            sorted_list = sorted(s, **kwargs)
+            if len(sorted_list) <= 5:
+                return ", ".join([str(user) for user in sorted_list])
+            return "{}, ...".format(", ".join([str(user) for user in sorted_list[:5]]))
+
+        members = self.recursive_member_users
+
+        non_users = set(filter(lambda user: not user.valid, members))
+        if non_users:
+            raise Exception("Error: Group {} has {} members ({}) not defined as a user.".format(self.name, len(non_users), shortened_user_list(non_users)))
+
+        members_with_email = set(filter(lambda user: user.has_email_delivery, members))
+
+        members_with_email_list = sorted(members_with_email, key=lambda entity: entity.friendly_sort_key)
+        sorted_member_forwards = [e for user in members_with_email_list for e in  sorted(user.email_forward)]
+
+        recipients = sorted_email_recipients + sorted_member_forwards
+
+        if len(recipients) > 0:
+            d.warnings = []
+
+            members_without_email = members - members_with_email
+            if len(members_without_email) > 0:
+                d.warnings.append("{} has {} members ({}) which do not have email delivery enabled.".format(self, len(members_without_email), shortened_user_list(members_without_email)))
+
+            members_with_external_forward = set(filter(lambda user: user.external_forward, members_with_email))
+            if len(members_with_external_forward) > 0:
+                d.warnings.append("Group {} has {} members ({}) which have external forwarding enabled. Delivery may be unreliable.".format(self.name, len(members_with_external_forward), shortened_user_list(members_with_external_forward)))
+            if any([addr.external for addr in sorted_email_recipients]):
+                d.warnings.append("Group {} has external recipients (via email_recipient). Delivery may be unreliable.".format(self.name))
+
+            num_groups = len(self.member_groups)
+            d.recipients = recipients
+            via_text = " via {} other groups".format(num_groups-1) if num_groups > 1 else ""
+            d.comment = "{}\n has {} members and {} other recipients{}".format(self, len(sorted_member_forwards), len(sorted_email_recipients), via_text)
+            d.defined = True
+        else:
+            d.comment="Group {} has email addresses ({}) but no members (with email delivery enabled).".format(self.name, ", ".join([e.address for e in self.addresses]))
+
+        return d
+
+    @property
+    def valid(self):
+        return self.name is not None
+
+    @property
+    def member_users(self):
+        return self._member_users
+
+    def add_member_user(self, user):
+        self._member_users.add(user)
+
+    @property
+    def recursive_member_users(self):
+        return {user for group in self.member_groups for user in group.member_users}
+
+    @property
+    def member_groups(self):
+        return self._member_groups
+
+    def add_member_group(self, group):
+        self._member_groups.add(group)
+
+    @property
+    def email_enabled(self):
+        return len(self.addresses) > 0
+
+    @property
+    def recursive_email_recipients(self):
+        def email_recipients_of_group(group):
+            if group.has_email_recipients:
+                email_recipients = group.email_recipients
+                if email_recipients is None:
+                    return set()
+                return email_recipients
+            return set()
+
+        def email_recipients_of_groups(groups):
+            return {member for group in groups for member in email_recipients_of_group(group)}
+
+        return email_recipients_of_groups(self.member_groups)
+
+    @property
+    def email_recipients(self):
+        if self._email_recipients is None:
+            raise Exception("tried to get email_recipients of group {} but it has none".format(self))
+        return self._email_recipients
+
+    def add_email_recipient(self, e):
+        if self._email_recipients is None:
+            self._email_recipients = set()
+        self._email_recipients.add(e)
+
+    @property
+    def has_email_recipients(self):
+        return self._email_recipients is not None
+
+class GroupRegistry():
+    """Manages Group objects."""
+
+    def __init__(self):
+        self.by_groupids = dict()
+
+    def get(self, groupid, create=False):
+        group = self.by_groupids.get(groupid, None)
+        if group is not None:
+            return group
+        if not create:
+            return None
+        group = Group(groupid)
+        self.by_groupids[groupid] = group
+        return group
+
+    def sorted_by(self, **kwargs):
+        return sorted(self.by_groupids.values(), **kwargs)
+
+class Registry:
+    """Collects imported data."""
+
+    def __init__(self, config):
+        self.all_emailaddresses = EmailAddressRegistry(config.opt_default_domain)
+        self.enabled_domains = DomainRegistry(config.opt_default_domain)
+        self.all_users = UserRegistry()
+        self.all_groups = GroupRegistry()
+
+class DataSource:
+    """Represents a source from which data is imported."""
+
+    def __init__(self, **input_config):
+        # psycopg2 is much faster than pgdb
+        def driver_connect(driver="psycopg2", connection_string=None, **driver_parameters):
+            driver_module = importlib.import_module(driver)
+            # (currently no queries actually use any parameters)
+            #assert driver_module.paramstyle == 'pyformat'
+            return driver_module.connect(*([] if connection_string is None else [connection_string]), **driver_parameters)
+
+        input_connection = driver_connect(**input_config)
+        self.input_cursor = input_connection.cursor()
+        self.input_cursor.arraysize = 256
+
+    def fetch(self, query):
+        count = 0
+        self.input_cursor.execute(query)
+        while True:
+            rows = self.input_cursor.fetchmany()
+            if len(rows) == 0:
+                #eprint("Stats: '''{}''' generated {} rows.".format(query, count))
+                break
+            count += len(rows)
+            yield from rows
+
+# Output
+class TableFile:
+    """Creates text files in Postfix table format."""
+
+    def __init__(self, f):
+        self.f = f
+
+    # print to the file
+    def print(self, *args, **kwargs):
+        print(*args, file=self.f, **kwargs)
+
+    # print to the file, prefixing each non-empty line with "#" and another optional string
+    def comment(self, s, prefix=""):
+        self.print("\n".join(["#{}{}".format(prefix if len(s.strip()) > 0 else "", s) for s in s.split("\n")]))
+
+    # print to the file, prefixing each line with "# Warning: "
+    def warning(self, s):
+        self.print("\n".join(["# Warning: {}".format(s) for s in s.split("\n")]))
+
+class VirtualFile(TableFile):
+    """Creates a Postfix virtual file."""
+
+    # output an address to addresses relation
+    # uses str(address)
+    def define_address(self, address, *recipients):
+        if len(recipients) < 5:
+            self.print("{} {}".format(address, ", ".join([str(e) for e in recipients])))
+        else:
+            self.print("{}\n {}".format(address, ",\n ".join([str(e) for e in recipients])))
+
+    # output a number of domain lines
+    def define_domains(self, *domains):
+        for domain in domains:
+            self.define_address(domain, "VIRTUAL_DOMAIN")
+
+    # define a multi-address to multi-address relation, with additional comments and warnings
+    # comment is a string, warnings is an array of strings
+    def define_addresses(self, addresses, recipients, comment=None, warnings=None):
+        if comment is not None:
+            self.comment(comment, prefix=" ")
+        if warnings is not None and len(warnings) > 0:
+            self.warning("\n".join(warnings))
+        for alias in addresses:
+            self.define_address(alias, *recipients)
+
+    # output a comment about why a number of addresses are left out
+    def reject_addresses(self, *addresses, comment=None):
+        if comment is not None:
+            self.comment(comment, prefix=" ")
+        for address in addresses:
+            self.comment('{} (rejected)'.format(address))
+
+    # output a section comment, with an optional extra line describing the section
+    def start_section(self, name, comment=None):
+        self.comment("""
+{}
+{}""".format(name, " {}\n".format(comment) if comment is not None else ""), prefix=" ")
+
+    # output addresses and comments for a user or group
+    def add_entity(self, entity):
+        if entity.email_enabled:
+            delivery = entity.delivery
+            if delivery.defined:
+                self.define_addresses(entity.addresses, delivery.recipients, comment=delivery.comment, warnings=delivery.warnings)
+            else:
+                self.reject_addresses(*entity.addresses, comment=delivery.comment)
+
+    # output addresses and comments for a list of users or groups
+    def add_entities(self, entities):
+        for entity in entities:
+            self.add_entity(entity)
+
+    def define(self, registry):
+        self.start_section("DOMAINS", comment="Domains listed here are considered local.")
+        self.define_domains(*sorted(registry.enabled_domains.domain_names))
+
+        self.start_section("USERS")
+        self.add_entities(registry.all_users.sorted_by(key=lambda entity: entity.friendly_sort_key))
+
+        self.start_section("GROUPS")
+        self.add_entities(registry.all_groups.sorted_by(key=lambda entity: entity.friendly_sort_key))
+
+### Config ###
+
+# The config file must contain an [input] section.
+# The "driver" value determines which database driver to use, default is PostgreSQL.
+# The "connection_string" is optional and is provided as argument to the driver.
+# All other values are given as keyword arguments to the driver's connect() method.
+
+class Config(configparser.ConfigParser):
+    """Parser for the config .ini file format."""
+
+    def __init__(self, config_file):
+        super().__init__()
+        # set defaults
+        self.read_dict({
+            'options': {
+                'fetch_module': 'fetch_data'
+            },
+            'output': {
+                'virtual_file': 'virtual'
+            }
+        })
+        self.read(config_file)
+
+        ## Parse config
+
+        assert self['input'] is not None
+
+        ## Output options
+
+        self.opt_fetch_module = self.get('options', 'fetch_module')
+        self.opt_default_domain = self.get('output', 'default_domain')
+        self.opt_virtual_file_path = self.get('output', 'virtual_file')
+
+### MAIN ###
+
+def main(config_file):
+    config = Config(config_file)
+
+    fetch_module = importlib.import_module(config.opt_fetch_module)
+
+    # connect to database, based on config
+    # we use the whole input section as arguments to driver_connect()
+    datasource = DataSource(**config['input'])
+
+    registry = Registry(config)
+
+    fetch_module.fetch_data(datasource, registry, config)
+
+    with open(config.opt_virtual_file_path, mode='w') as virtual_file:
+        vf = VirtualFile(virtual_file)
+        vf.define(registry)
+
+main(sys.argv[1:])
+
