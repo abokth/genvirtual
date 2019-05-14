@@ -206,7 +206,7 @@ class Group():
         self._email_recipients = None
 
     def __str__(self):
-        return "Group {}".self.groupid if self.name is None else "Group {} ({})".format(self.name, self.groupid)
+        return "Group {}".format(self.groupid) if self.name is None else "Group {} ({})".format(self.name, self.groupid)
 
     def __eq__(self, other):
         return self.groupid == other.groupid
